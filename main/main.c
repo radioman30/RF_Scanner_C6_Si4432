@@ -41,12 +41,16 @@
 #define BAND_START_KHZ 433050u
 #define BAND_STEP_KHZ  100u
 #define BAND_NCH       18
-#define RSSI_MARGIN    24
+#define RSSI_MARGIN    28     // ~14 dB peste mediana; zgomotul ajunge la ~+23
 // Intre baleiaje receptorul sta "parcat" cu filtru larg si intrerupere de prag RSSI,
 // ca sa prinda si rafalele scurte care cad cat timp se deseneaza ecranul.
 // Centru 434.15 + filtru ~620 kHz => acopera 433.84-434.46 (433.92 si 434.42).
 #define PARK_CENTER_KHZ 434150u
 #define PARK_BW_KHZ     620
+// Marja intreruperii fata de fondul parcarii. Masurat pe placa (26 sep): cu filtrul
+// larg zgomotul are varfuri mari; +24 declansa 16-19 din 20 cicluri, +36 1-5, +42
+// rar, +48 niciodata. Semnalele slabe raman acoperite de baleiaj (marja RSSI_MARGIN).
+#define PARK_MARGIN     48
 #define EVENT_HOLD_US   300000    // pauze mai scurte de atat = aceeasi apasare
 
 // Beacon TX: banda de radioamatori 70 cm, in afara benzii LPD a cheilor/portilor.
@@ -91,6 +95,7 @@ static void scan_band(uint8_t *rssi, int nch)
     si4432_set_freq_khz(BAND_START_KHZ);
     si4432_set_hop_step_khz(BAND_STEP_KHZ);
     si4432_config_scan(150);                 // readuce filtrul IF dupa parcare
+    vTaskDelay(pdMS_TO_TICKS(3));            // asezare AGC dupa reconfigurare
     for (int ch = 0; ch < nch; ch++) {
         si4432_set_channel(ch);
         esp_rom_delay_us(400);
@@ -108,9 +113,9 @@ static void park_and_arm(void)
     si4432_config_scan(PARK_BW_KHZ);
     esp_rom_delay_us(500);
     uint8_t r = si4432_rssi_raw();
-    if (park_floor == 0 || r < park_floor) park_floor = r;
+    if (park_floor == 0) park_floor = r;
     else park_floor = (park_floor * 15 + r) / 16;
-    int thr = park_floor + RSSI_MARGIN;
+    int thr = park_floor + PARK_MARGIN;
     si4432_rssi_irq_arm(thr > 255 ? 255 : (uint8_t)thr);
 }
 
@@ -402,10 +407,16 @@ void app_main(void)
         for (int i = 0; i < BAND_NCH; i++) if (rssi[i] > peak) { peak = rssi[i]; peak_ch = i; }
         uint32_t peak_khz = BAND_START_KHZ + peak_ch * BAND_STEP_KHZ;
 
-        uint8_t band_min = 255;
-        for (int i = 0; i < BAND_NCH; i++) if (rssi[i] < band_min) band_min = rssi[i];
-        if (band_min < noise_floor) noise_floor = band_min;
-        else noise_floor = (noise_floor * 15 + band_min) / 16;
+        // fondul = mediana canalelor. Cu minimul, varfurile zgomotului (max din 18
+        // citiri) ieseau cu ~28 peste fond, adica peste RSSI_MARGIN => EMITE fals.
+        uint8_t srt[BAND_NCH];
+        memcpy(srt, rssi, sizeof(srt));
+        for (int i = 1; i < BAND_NCH; i++) {
+            uint8_t v = srt[i]; int j = i - 1;
+            while (j >= 0 && srt[j] > v) { srt[j + 1] = srt[j]; j--; }
+            srt[j + 1] = v;
+        }
+        noise_floor = (noise_floor * 15 + srt[BAND_NCH / 2]) / 16;
 
         bool active = (peak > noise_floor + RSSI_MARGIN);
         if (active || irq_hit) {
@@ -418,10 +429,16 @@ void app_main(void)
         // reconfigureaza singura receptorul)
         if (mode != MODE_IDENTIFY) { park_and_arm(); parked = true; }
 
-        static int logdiv = 0;
-        if (++logdiv >= 20) { logdiv = 0;
-            ESP_LOGI("scan", "peak=%u @%luKHz floor=%u %s", peak,
-                     (unsigned long)peak_khz, noise_floor, active ? "ACTIV" : "-"); }
+        static int logdiv = 0, n_act = 0, n_irq = 0;
+        static uint8_t pk_max = 0;
+        if (active) n_act++;
+        if (irq_hit) n_irq++;
+        if (peak > pk_max) pk_max = peak;
+        if (++logdiv >= 20) {
+            ESP_LOGI("scan", "20 cicluri: scan_activ=%d irq=%d peak_max=%u floor=%u park_floor=%u",
+                     n_act, n_irq, pk_max, noise_floor, park_floor);
+            logdiv = 0; n_act = 0; n_irq = 0; pk_max = 0;
+        }
 
         ui_header(mode, chip_temp);
 
