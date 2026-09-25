@@ -54,7 +54,12 @@ void si4432_idle(void);
 uint8_t si4432_rssi_raw(void);   // 0..255
 int     si4432_rssi_dbm(void);   // aproximativ
 
-void si4432_config_scan(uint32_t bw_khz);  // mod detectie energie / baleiaj RSSI
+void si4432_config_scan(uint32_t bw_khz);  // mod detectie energie / baleiaj RSSI, filtru IF ~bw_khz (19..620)
+
+// Intrerupere de prag RSSI: armare cu prag (unitati brute RSSI), interogare (sterge starea)
+void si4432_rssi_irq_arm(uint8_t thr_raw);
+bool si4432_rssi_irq_fired(void);
+void si4432_rssi_irq_disarm(void);
 void si4432_config_ook_raw(void);          // OOK direct mode, data bruta pe GPIO2->rxdata
 int  si4432_rxdata_level(void);            // nivelul liniei de date brute (0/1)
 

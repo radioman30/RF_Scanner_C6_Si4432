@@ -98,15 +98,30 @@ int si4432_rxdata_level(void)
     return (s_rxd >= 0) ? gpio_get_level(s_rxd) : 0;
 }
 
+// Filtrul IF (reg 0x1C = dwn3_bypass<<7 | ndec_exp<<4 | filset), din tabelul
+// "Filter Bandwidth Parameters" al datasheet-ului Si4432. Se alege cea mai mica
+// latime >= cea ceruta. 150 kHz ramane pe 0x9A, valoarea validata pe placa.
+static const struct { uint16_t khz10; uint8_t reg; } IFBW_TAB[] = {
+    {  189, 0x21 }, {  210, 0x22 }, {  240, 0x24 }, {  282, 0x25 }, {  322, 0x26 },
+    {  377, 0x11 }, {  452, 0x13 }, {  562, 0x15 }, {  641, 0x16 }, {  752, 0x01 },
+    {  900, 0x03 }, { 1121, 0x05 }, { 1379, 0x07 }, { 1678, 0x95 }, { 2251, 0x81 },
+    { 2849, 0x84 }, { 3618, 0x89 }, { 4684, 0x8B }, { 5770, 0x8D }, { 6207, 0x8E },
+};
+
+static uint8_t ifbw_reg(uint32_t bw_khz)
+{
+    if (bw_khz == 150) return 0x9A;
+    for (size_t i = 0; i < sizeof(IFBW_TAB) / sizeof(IFBW_TAB[0]); i++)
+        if (IFBW_TAB[i].khz10 >= bw_khz * 10) return IFBW_TAB[i].reg;
+    return 0x8E;                             // maxim ~620 kHz
+}
+
 // Config comun de receptor (AGC pornit, fără packet handler)
 static void common_rx_setup(uint32_t bw_khz)
 {
     si4432_reg_write(SI_R_DATACTRL, 0x00);   // packet handler off
     si4432_reg_write(SI_R_AGCOVR,  0x60);    // AGC automat pornit
-    // Latimea de banda IF: valoare din WDS/calculator Silicon Labs.
-    // 0x9A ~ 150 kHz (bun compromis pt. detectie). Regenerati cu WDS pt. alt BW.
-    (void)bw_khz;
-    si4432_reg_write(SI_R_IFBW, 0x9A);
+    si4432_reg_write(SI_R_IFBW, ifbw_reg(bw_khz));
     si4432_reg_write(SI_R_AFCGEAR,   0x40);
     si4432_reg_write(SI_R_AFCTIMING, 0x0A);
     si4432_reg_write(SI_R_RSSITH, 0x1E);
@@ -120,6 +135,27 @@ void si4432_config_scan(uint32_t bw_khz)
     si4432_reg_write(SI_R_MODMODE2, 0x22);   // dtmod=FIFO, modtyp=FSK (energie)
     si4432_reg_write(SI_R_GPIO2CFG, 0x00);
     si4432_enter_rx();
+}
+
+// ---- Intrerupere de prag RSSI (irssi): starea ramane agatata pana la citire,
+// deci prinde si rafalele care cad cat timp CPU-ul deseneaza ecranul ----
+void si4432_rssi_irq_arm(uint8_t thr_raw)
+{
+    si4432_reg_write(SI_R_RSSITH, thr_raw);
+    si4432_reg_write(SI_R_IEN2, 0x10);       // enrssi
+    (void)si4432_reg_read(SI_R_ISTAT1);      // citirea sterge starile vechi
+    (void)si4432_reg_read(SI_R_ISTAT2);
+}
+
+bool si4432_rssi_irq_fired(void)
+{
+    (void)si4432_reg_read(SI_R_ISTAT1);
+    return (si4432_reg_read(SI_R_ISTAT2) & 0x10) != 0;   // irssi
+}
+
+void si4432_rssi_irq_disarm(void)
+{
+    si4432_reg_write(SI_R_IEN2, 0x00);
 }
 
 #define SI_R_TXPOW 0x6D

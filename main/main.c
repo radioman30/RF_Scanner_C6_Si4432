@@ -3,7 +3,7 @@
 //  1 GO/NOGO   : "emite?" - EMITE/NIMIC + nivel
 //  2 FRECVENTA : mini-spectru + frecventa varfului
 //  3 IDENTIFICARE : modulatie (OOK/FSK) + TIP (TELECOMANDA/SENZOR/FM) + bitrate
-//  4 TX TEST   : emite in CW (Morse) cuvantul "TEST" pe 433, putere minima
+//  4 TX TEST   : beacon MCW (Morse) pe TX_FREQ_KHZ, in afara benzii LPD 433.05-434.79
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -41,8 +41,18 @@
 #define BAND_START_KHZ 433050u
 #define BAND_STEP_KHZ  100u
 #define BAND_NCH       18
-#define PARK_KHZ       433920u
 #define RSSI_MARGIN    24
+// Intre baleiaje receptorul sta "parcat" cu filtru larg si intrerupere de prag RSSI,
+// ca sa prinda si rafalele scurte care cad cat timp se deseneaza ecranul.
+// Centru 434.15 + filtru ~620 kHz => acopera 433.84-434.46 (433.92 si 434.42).
+#define PARK_CENTER_KHZ 434150u
+#define PARK_BW_KHZ     620
+#define EVENT_HOLD_US   300000    // pauze mai scurte de atat = aceeasi apasare
+
+// Beacon TX: banda de radioamatori 70 cm, in afara benzii LPD a cheilor/portilor.
+#define TX_FREQ_KHZ    432500u
+#define TX_POWER       6          // 0..7 => 1,2,5,8,11,14,17,20 dBm
+static const int8_t TX_DBM[8] = { 1, 2, 5, 8, 11, 14, 17, 20 };
 
 typedef enum { MODE_GONOGO=0, MODE_FREQ, MODE_IDENTIFY, MODE_TXTEST, MODE_COUNT } mode_t;
 static const char *MODE_NAME[] = { "GO/NOGO", "FRECVENTA", "IDENTIFICARE", "TX TEST CW" };
@@ -77,14 +87,31 @@ static void led_set(uint8_t r, uint8_t g, uint8_t b)
 static uint8_t noise_floor = 60;
 static void scan_band(uint8_t *rssi, int nch)
 {
+    si4432_set_channel(0);
     si4432_set_freq_khz(BAND_START_KHZ);
     si4432_set_hop_step_khz(BAND_STEP_KHZ);
-    si4432_enter_rx();
+    si4432_config_scan(150);                 // readuce filtrul IF dupa parcare
     for (int ch = 0; ch < nch; ch++) {
         si4432_set_channel(ch);
         esp_rom_delay_us(400);
         rssi[ch] = si4432_rssi_raw();
     }
+}
+
+// Parcheaza receptorul pe filtru larg si armeaza intreruperea de prag RSSI.
+// Pragul urmareste zgomotul de fond al filtrului larg (alt nivel decat la baleiaj).
+static uint8_t park_floor = 0;
+static void park_and_arm(void)
+{
+    si4432_set_channel(0);
+    si4432_set_freq_khz(PARK_CENTER_KHZ);
+    si4432_config_scan(PARK_BW_KHZ);
+    esp_rom_delay_us(500);
+    uint8_t r = si4432_rssi_raw();
+    if (park_floor == 0 || r < park_floor) park_floor = r;
+    else park_floor = (park_floor * 15 + r) / 16;
+    int thr = park_floor + RSSI_MARGIN;
+    si4432_rssi_irq_arm(thr > 255 ? 255 : (uint8_t)thr);
 }
 
 // ---------------- Identificare (modulatie + tip) ----------------
@@ -111,19 +138,37 @@ static ident_t identify(uint32_t peak_khz)
     }
     bool ook = (edges > 20 && minp < 3000);
 
-    // (2) baleiaj fin +-100 kHz pt. lobii FSK
-    si4432_config_scan(150);
+    // (2) baleiaj fin +-100 kHz pt. lobii FSK. Filtrul IF trebuie sa fie mai ingust
+    // decat 2 pasi (aici ~38 kHz la pas de 20 kHz); cu filtrul de 150 kHz orice semnal
+    // puternic ocupa 4+ puncte si iese "FSK" fals. Max-hold ~300 ms, ca rafalele
+    // intermitente ale telecomenzii sa apuce sa umple toate punctele.
+    si4432_set_channel(0);
     si4432_set_freq_khz(peak_khz - 100);
     si4432_set_hop_step_khz(20);
-    si4432_enter_rx();
-    uint8_t fmax = 0, fine[11];
-    for (int i = 0; i < 11; i++) { si4432_set_channel(i); esp_rom_delay_us(400); fine[i] = si4432_rssi_raw(); if (fine[i] > fmax) fmax = fine[i]; }
+    si4432_config_scan(37);
+    uint8_t fine[11] = { 0 }, fmax = 0, fmin = 255;
+    int64_t tf = esp_timer_get_time();
+    while (esp_timer_get_time() - tf < 300000) {
+        for (int i = 0; i < 11; i++) {
+            si4432_set_channel(i);
+            esp_rom_delay_us(400);
+            uint8_t v = si4432_rssi_raw();
+            if (v > fine[i]) fine[i] = v;
+        }
+    }
+    for (int i = 0; i < 11; i++) {
+        if (fine[i] > fmax) fmax = fine[i];
+        if (fine[i] < fmin) fmin = fine[i];
+    }
+    bool fine_sig = (fmax >= fmin + 12);     // semnal clar peste fond (>= 6 dB)
     int lobes = 0;
-    for (int i = 0; i < 11; i++) if (fine[i] + 12 >= fmax) lobes++;
+    if (fine_sig)
+        for (int i = 0; i < 11; i++) if (fine[i] + 12 >= fmax) lobes++;
 
     if (ook) { r.mod = "OOK/ASK"; r.bitrate = minp > 0 ? (int)(1000000 / minp) : 0; }
     else if (lobes >= 4) { r.mod = "FSK/GFSK"; r.dev_khz = (lobes * 20) / 2; }
-    else r.mod = "CW/?";
+    else if (fine_sig) r.mod = "CW/?";
+    else r.mod = "?";                        // semnalul a disparut in timpul analizei
 
     // (3) tipul semnalului: monitorizeaza ~1.2 s la frecventa varfului
     si4432_config_scan(150);
@@ -273,7 +318,9 @@ void app_main(void)
     mode_t mode = MODE_GONOGO;
     uint8_t rssi[BAND_NCH];
     char line[32];
-    int burst_count = 0;
+    int burst_count = 0;               // apasari (rafale separate de >EVENT_HOLD_US)
+    int64_t last_event = -EVENT_HOLD_US * 2;
+    bool parked = false;
     // latch pt. rezultatul de identificare (sa nu dispara imediat)
     ident_t held = { "?", "-", 0, 0 };
     bool has_held = false;
@@ -300,6 +347,14 @@ void app_main(void)
             lum_until = esp_timer_get_time() + 1200000;   // arata 1.2 s
         }
 
+        // rafala prinsa de intreruperea RSSI cat timp receptorul a stat parcat
+        bool irq_hit = false;
+        if (parked) {
+            irq_hit = si4432_rssi_irq_fired();
+            si4432_rssi_irq_disarm();
+            parked = false;
+        }
+
         int64_t tnow = esp_timer_get_time();
         if (tnow - last_temp > 2000000) { chip_temp = si4432_read_temp_c(); last_temp = tnow; }
 
@@ -307,13 +362,19 @@ void app_main(void)
         if (mode == MODE_TXTEST) {
             ui_header(mode, chip_temp);
             disp_fill(0, 44, LCD_W, LCD_H - 44, C_BLACK);
-            disp_text(10, 52, "TX BEACON", C_RED, C_BLACK, 3);
-            disp_text(10, 92, TX_MSG, C_GREEN, C_BLACK, 2);
+            disp_text(10, 48, "TX BEACON", C_RED, C_BLACK, 3);
+            snprintf(line, sizeof(line), "%lu.%03lu MHZ",
+                     (unsigned long)(TX_FREQ_KHZ / 1000), (unsigned long)(TX_FREQ_KHZ % 1000));
+            disp_text(10, 80, line, C_YELLOW, C_BLACK, 3);
+            disp_text(10, 112, TX_MSG, C_GREEN, C_BLACK, 2);
             disp_text(10, 140, "BOOT = STOP", C_GRAY, C_BLACK, 2);
+            snprintf(line, sizeof(line), "%d DBM", TX_DBM[TX_POWER]);
+            disp_text(220, 140, line, C_WHITE, C_BLACK, 2);
             disp_flush();
 
-            si4432_set_freq_khz(PARK_KHZ);
-            si4432_set_tx_power(6);
+            si4432_set_channel(0);
+            si4432_set_freq_khz(TX_FREQ_KHZ);
+            si4432_set_tx_power(TX_POWER);
             si4432_tx_prep();
             led_set(30, 0, 0);
             bool stop = send_morse_text(TX_MSG, TX_UNIT);
@@ -347,6 +408,15 @@ void app_main(void)
         else noise_floor = (noise_floor * 15 + band_min) / 16;
 
         bool active = (peak > noise_floor + RSSI_MARGIN);
+        if (active || irq_hit) {
+            if (tnow - last_event > EVENT_HOLD_US) burst_count++;   // apasare noua
+            last_event = tnow;
+        }
+        bool emitting = (tnow - last_event < EVENT_HOLD_US);
+
+        // intre baleiaje: parcare cu intrerupere RSSI (nu in IDENTIFICARE, care
+        // reconfigureaza singura receptorul)
+        if (mode != MODE_IDENTIFY) { park_and_arm(); parked = true; }
 
         static int logdiv = 0;
         if (++logdiv >= 20) { logdiv = 0;
@@ -357,18 +427,18 @@ void app_main(void)
 
         if (mode == MODE_GONOGO) {
             disp_fill(0, 44, LCD_W, LCD_H - 44, C_BLACK);
-            if (active) { burst_count++; led_set(0, 30, 0);
+            if (emitting) { led_set(0, 30, 0);
                 disp_text(10, 50, "EMITE", C_GREEN, C_BLACK, 5); }
             else { led_set(0, 0, 0);
                 disp_text(10, 50, "NIMIC", C_GRAY, C_BLACK, 5); }
             snprintf(line, sizeof(line), "%d DBM", (peak / 2) - 130);
             disp_text(10, 104, line, C_WHITE, C_BLACK, 2);
-            snprintf(line, sizeof(line), "BURST %d", burst_count);
+            snprintf(line, sizeof(line), "APASARI %d", burst_count);
             disp_text(160, 104, line, C_CYAN, C_BLACK, 2);
             int bar = (peak > noise_floor) ? (peak - noise_floor) * LCD_W / 100 : 0;
             if (bar > LCD_W) bar = LCD_W;
             disp_fill(0, 150, LCD_W, 18, C_DGRAY);
-            disp_fill(0, 150, bar, 18, active ? C_GREEN : C_ORANGE);
+            disp_fill(0, 150, bar, 18, emitting ? C_GREEN : C_ORANGE);
 
         } else if (mode == MODE_FREQ) {
             disp_fill(0, 44, LCD_W, LCD_H - 44, C_BLACK);
