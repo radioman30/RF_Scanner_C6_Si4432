@@ -6,6 +6,7 @@
 //  4 TX TEST   : beacon MCW (Morse) pe TX_FREQ_KHZ, in afara benzii LPD 433.05-434.79
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/spi_master.h"
@@ -119,8 +120,107 @@ static void park_and_arm(void)
     si4432_rssi_irq_arm(thr > 255 ? 255 : (uint8_t)thr);
 }
 
+// ---------------- Frecventa exacta (baleiaj fin, margini la -6 dB) ----------------
+// AFC-ul Si4432 ramane pe 0 fara pachet recunoscut (verificat pe placa 26 sep), deci
+// frecventa se masoara din spectru. Filtrul IF de 75 kHz: cele mai inguste (19 kHz)
+// lasa receptorul surd (verificat pe placa). Cu 75 kHz raspunsul la un semnal ingust
+// e un platou cat filtrul, iar centrul lui = frecventa semnalului; se ia mijlocul
+// dintre marginile la -6 dB (interpolate), robust la forma platoului. Max-hold
+// 400 ms ca rafalele intermitente sa umple toate punctele.
+#define FINE_SPAN_KHZ  160
+#define FINE_STEP_KHZ  5
+#define FINE_N         (2 * FINE_SPAN_KHZ / FINE_STEP_KHZ + 1)
+#define HOP_N          ((FINE_N + 1) / 2)    // canale de 10 kHz pe trecere
+#define FINE_BW_KHZ    75
+// Corectie de calibrare (eroarea cuartului Si4432, ~25 ppm, + a metodei). Masurata
+// 26 sep cu statia portabila pe 433.920 (purtatoare FM fara modulatie): 8 masuratori
+// 433.9293-433.9313 MHz, mediana 433.9308 => -10.8 kHz.
+#define FREQ_CAL_HZ    (-10800)
+
+// Frecventa se schimba prin registrul de canal (hopping), ca la baleiajul normal:
+// scrierea directa a registrelor de frecventa in RX nu reacorda PLL-ul (verificat
+// pe placa). Doua treceri cu baza decalata 5 kHz, pas de hopping 10 kHz.
+static void fine_spectrum(uint32_t f0, uint32_t bw_khz, uint8_t *mh)
+{
+    memset(mh, 0, FINE_N);
+    si4432_set_hop_step_khz(10);
+    int64_t t0 = esp_timer_get_time();
+    while (esp_timer_get_time() - t0 < 400000) {
+        for (int pass = 0; pass < 2; pass++) {
+            si4432_set_channel(0);
+            si4432_set_freq_khz(f0 + pass * FINE_STEP_KHZ);
+            si4432_config_scan(bw_khz);      // idle -> RX: PLL pe baza noua
+            esp_rom_delay_us(500);
+            for (int ch = 0; ch < HOP_N; ch++) {
+                int i = 2 * ch + pass;
+                if (i >= FINE_N) break;
+                si4432_set_channel(ch);
+                esp_rom_delay_us(300);
+                uint8_t v = si4432_rssi_raw();
+                if (v > mh[i]) mh[i] = v;
+            }
+        }
+    }
+}
+
+static bool measure_freq_hz(uint32_t peak_khz, uint32_t *f_hz)
+{
+    uint8_t mh[FINE_N];
+    uint32_t f0 = peak_khz - FINE_SPAN_KHZ;
+    fine_spectrum(f0, FINE_BW_KHZ, mh);
+    uint8_t rmax = 0, rmin = 255;
+    for (int i = 0; i < FINE_N; i++) {
+        if (mh[i] > rmax) rmax = mh[i];
+        if (mh[i] < rmin) rmin = mh[i];
+    }
+    if (rmax < rmin + 16) return false;      // sub 8 dB peste fond: semnal pierdut
+    int L = rmax - 12;                       // -6 dB (RSSI = 0.5 dB/unitate)
+    int il = 0, ir = FINE_N - 1;
+    while (il < FINE_N && mh[il] < L) il++;
+    while (ir >= 0 && mh[ir] < L) ir--;
+    if (il == 0 || ir == FINE_N - 1) return false;   // platoul atinge marginea ferestrei
+    // interpolare liniara intre punctul de sub prag si cel de peste
+    double fl = f0 + FINE_STEP_KHZ * (il - 1 + (double)(L - mh[il - 1]) / (mh[il] - mh[il - 1]));
+    double fr = f0 + FINE_STEP_KHZ * (ir + (double)(mh[ir] - L) / (mh[ir] - mh[ir + 1]));
+    // un semnal real da un platou cel putin cat filtrul (~60-90 kHz masurat);
+    // mai ingust = varf de zgomot
+    if (fr - fl < 40) return false;
+    *f_hz = (uint32_t)lround((fl + fr) / 2 * 1000.0) + FREQ_CAL_HZ;
+    ESP_LOGI("freq", "margini -6dB %.1f / %.1f kHz, latime %.1f kHz, centru %lu Hz",
+             fl, fr, fr - fl, (unsigned long)*f_hz);
+    return true;
+}
+
+// Frecventa nominala cea mai apropiata (telecomenzi EU) si abaterea fata de ea
+static const uint32_t NOMINAL_KHZ[] = { 433920, 434420 };
+static uint32_t nearest_nominal(uint32_t f_hz)
+{
+    uint32_t best = NOMINAL_KHZ[0];
+    for (size_t i = 1; i < sizeof(NOMINAL_KHZ) / sizeof(NOMINAL_KHZ[0]); i++)
+        if (llabs((int64_t)f_hz - NOMINAL_KHZ[i] * 1000LL) < llabs((int64_t)f_hz - best * 1000LL))
+            best = NOMINAL_KHZ[i];
+    return best;
+}
+
+// "433.918 MHZ" si "ABATERE -2.4 KHZ (433.920)"
+static void fmt_freq(char *out, size_t n, uint32_t f_hz)
+{
+    uint32_t khz = (f_hz + 500) / 1000;
+    snprintf(out, n, "%lu.%03lu MHZ", (unsigned long)(khz / 1000), (unsigned long)(khz % 1000));
+}
+static void fmt_dev(char *out, size_t n, uint32_t f_hz)
+{
+    uint32_t nom = nearest_nominal(f_hz);
+    int32_t d = (int32_t)((int64_t)f_hz - nom * 1000LL);
+    int32_t a = d < 0 ? -d : d;
+    if (a > 999999) a = 999999;              // max +-120 kHz din baleiaj; limita pt. snprintf
+    snprintf(out, n, "ABATERE %s%d.%d KHZ (%u.%03u)", d < 0 ? "-" : "",
+             (int)(a / 1000), (int)((a % 1000) / 100),
+             (unsigned)(nom / 1000 % 1000), (unsigned)(nom % 1000));
+}
+
 // ---------------- Identificare (modulatie + tip) ----------------
-typedef struct { const char *mod; const char *type; int bitrate; int dev_khz; } ident_t;
+typedef struct { const char *mod; const char *type; int bitrate; uint32_t f_hz; } ident_t;
 
 static ident_t identify(uint32_t peak_khz)
 {
@@ -128,6 +228,7 @@ static ident_t identify(uint32_t peak_khz)
 
     // (1) modulatie prin fronturile liniei brute OOK, ~50 ms
     si4432_config_ook_raw();
+    si4432_set_channel(0);                   // dupa baleiaj canalul ramane pe ultimul
     si4432_set_freq_khz(peak_khz);
     si4432_enter_rx();
     vTaskDelay(pdMS_TO_TICKS(2));
@@ -143,37 +244,8 @@ static ident_t identify(uint32_t peak_khz)
     }
     bool ook = (edges > 20 && minp < 3000);
 
-    // (2) baleiaj fin +-100 kHz pt. lobii FSK. Filtrul IF trebuie sa fie mai ingust
-    // decat 2 pasi (aici ~38 kHz la pas de 20 kHz); cu filtrul de 150 kHz orice semnal
-    // puternic ocupa 4+ puncte si iese "FSK" fals. Max-hold ~300 ms, ca rafalele
-    // intermitente ale telecomenzii sa apuce sa umple toate punctele.
-    si4432_set_channel(0);
-    si4432_set_freq_khz(peak_khz - 100);
-    si4432_set_hop_step_khz(20);
-    si4432_config_scan(37);
-    uint8_t fine[11] = { 0 }, fmax = 0, fmin = 255;
-    int64_t tf = esp_timer_get_time();
-    while (esp_timer_get_time() - tf < 300000) {
-        for (int i = 0; i < 11; i++) {
-            si4432_set_channel(i);
-            esp_rom_delay_us(400);
-            uint8_t v = si4432_rssi_raw();
-            if (v > fine[i]) fine[i] = v;
-        }
-    }
-    for (int i = 0; i < 11; i++) {
-        if (fine[i] > fmax) fmax = fine[i];
-        if (fine[i] < fmin) fmin = fine[i];
-    }
-    bool fine_sig = (fmax >= fmin + 12);     // semnal clar peste fond (>= 6 dB)
-    int lobes = 0;
-    if (fine_sig)
-        for (int i = 0; i < 11; i++) if (fine[i] + 12 >= fmax) lobes++;
-
-    if (ook) { r.mod = "OOK/ASK"; r.bitrate = minp > 0 ? (int)(1000000 / minp) : 0; }
-    else if (lobes >= 4) { r.mod = "FSK/GFSK"; r.dev_khz = (lobes * 20) / 2; }
-    else if (fine_sig) r.mod = "CW/?";
-    else r.mod = "?";                        // semnalul a disparut in timpul analizei
+    // (2) frecventa exacta, cat timp telecomanda inca emite
+    if (!measure_freq_hz(peak_khz, &r.f_hz)) r.f_hz = 0;
 
     // (3) tipul semnalului: monitorizeaza ~1.2 s la frecventa varfului
     si4432_config_scan(150);
@@ -196,6 +268,16 @@ static ident_t identify(uint32_t peak_khz)
     else if (bursts >= 3 || ratio > 0.30f) r.type = "TELECOMANDA";
     else if (activeCnt > 0)               r.type = "SENZOR";
     else                                  r.type = "-";
+
+    // Modulatia: OOK se vede in timp (amplitudinea pulseaza). Altfel anvelopa e
+    // constanta => FSK daca vine in rafale, purtatoare FM daca e continuu. In
+    // frecventa nu se poate deosebi: cu filtrul minim utilizabil (75 kHz) deviatia
+    // cheilor nu lateste spectrul (verificat pe placa: cheia Audi ~70 kHz, purtatoarea
+    // statiei ~90 kHz), iar filtrele mai inguste lasa receptorul surd.
+    if (ook) { r.mod = "OOK/ASK"; r.bitrate = minp > 0 ? (int)(1000000 / minp) : 0; }
+    else if (activeCnt == 0)          r.mod = "?";     // semnalul a disparut
+    else if (ratio > 0.85f)           r.mod = "FM/PURTATOARE";
+    else                              r.mod = "FSK/GFSK";
     return r;
 }
 
@@ -323,6 +405,8 @@ void app_main(void)
     mode_t mode = MODE_GONOGO;
     uint8_t rssi[BAND_NCH];
     char line[32];
+    uint32_t exact_hz = 0;             // ultima frecventa exacta masurata (mod FRECVENTA)
+    int64_t exact_at = 0;
     int burst_count = 0;               // apasari (rafale separate de >EVENT_HOLD_US)
     int64_t last_event = -EVENT_HOLD_US * 2;
     bool parked = false;
@@ -425,6 +509,15 @@ void app_main(void)
         }
         bool emitting = (tnow - last_event < EVENT_HOLD_US);
 
+        // mod FRECVENTA: masurare fina o data pe apasare (max o data la 1.5 s)
+        if (mode == MODE_FREQ && active && tnow - exact_at > 1500000) {
+            disp_text(6, 158, "MASOR FRECVENTA...", C_ORANGE, C_BLACK, 2);
+            disp_flush();
+            uint32_t f;
+            if (measure_freq_hz(peak_khz, &f)) exact_hz = f;
+            exact_at = esp_timer_get_time();
+        }
+
         // intre baleiaje: parcare cu intrerupere RSSI (nu in IDENTIFICARE, care
         // reconfigureaza singura receptorul)
         if (mode != MODE_IDENTIFY) { park_and_arm(); parked = true; }
@@ -467,14 +560,23 @@ void app_main(void)
                 uint16_t c = (i == peak_ch && active) ? C_GREEN : C_DGRAY;
                 disp_fill(i * bw, 44 + 84 - h, bw - 1, h, c);
             }
-            if (active) {
-                led_set(0, 20, 10);
+            // frecventa exacta ramane afisata 10 s dupa masurare
+            bool show_exact = exact_hz && (tnow - exact_at < 10000000);
+            if (active) led_set(0, 20, 10); else led_set(0, 0, 0);
+            if (show_exact) {
+                fmt_freq(line, sizeof(line), exact_hz);
+                disp_text(6, 132, line, C_YELLOW, C_BLACK, 3);
+                fmt_dev(line, sizeof(line), exact_hz);
+                disp_text(4, 158, line, C_ORANGE, C_BLACK, 2);
+            } else if (active) {
                 snprintf(line, sizeof(line), "%lu.%02lu MHZ",
                          (unsigned long)(peak_khz/1000), (unsigned long)((peak_khz%1000)/10));
                 disp_text(6, 132, line, C_YELLOW, C_BLACK, 3);
+            } else disp_text(6, 132, "-- SCAN --", C_GRAY, C_BLACK, 3);
+            if (active) {
                 snprintf(line, sizeof(line), "%d DBM", (peak / 2) - 130);
-                disp_text(210, 138, line, C_WHITE, C_BLACK, 2);
-            } else { led_set(0,0,0); disp_text(6, 132, "-- SCAN --", C_GRAY, C_BLACK, 3); }
+                disp_text(214, 138, line, C_WHITE, C_BLACK, 2);
+            }
 
         } else { // MODE_IDENTIFY
             int64_t now = esp_timer_get_time();
@@ -497,8 +599,9 @@ void app_main(void)
                 disp_text(6, 70, "ASTEPT SEMNAL", C_GRAY, C_BLACK, 2);
             } else {
                 led_set(0, 25, 0);
-                snprintf(line, sizeof(line), "%lu.%02lu MHZ",
-                         (unsigned long)(held_khz/1000), (unsigned long)((held_khz%1000)/10));
+                if (held.f_hz) fmt_freq(line, sizeof(line), held.f_hz);
+                else snprintf(line, sizeof(line), "%lu.%02lu MHZ",
+                              (unsigned long)(held_khz/1000), (unsigned long)((held_khz%1000)/10));
                 disp_text(6, 46, line, C_YELLOW, C_BLACK, 2);
                 snprintf(line, sizeof(line), "%d DBM", held_dbm);
                 disp_text(200, 46, line, C_WHITE, C_BLACK, 2);
@@ -506,8 +609,8 @@ void app_main(void)
                 disp_text(6, 98, held.type, C_GREEN, C_BLACK, 3);   // TIPUL, mare
                 if (held.bitrate > 0) { snprintf(line, sizeof(line), "%d BPS", held.bitrate);
                     disp_text(6, 140, line, C_WHITE, C_BLACK, 2); }
-                else if (held.dev_khz > 0) { snprintf(line, sizeof(line), "DEV %d KHZ", held.dev_khz);
-                    disp_text(6, 140, line, C_WHITE, C_BLACK, 2); }
+                if (held.f_hz) { fmt_dev(line, sizeof(line), held.f_hz);
+                    disp_text(6, 158, line, C_ORANGE, C_BLACK, 2); }
             }
         }
 

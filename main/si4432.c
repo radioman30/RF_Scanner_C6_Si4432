@@ -111,6 +111,10 @@ static const struct { uint16_t khz10; uint8_t reg; } IFBW_TAB[] = {
 static uint8_t ifbw_reg(uint32_t bw_khz)
 {
     if (bw_khz == 150) return 0x9A;
+    // Verificat pe placa (26 sep): 19 kHz (0x21) si 37 kHz (0x11) lasa receptorul
+    // aproape surd (cheia ~70 in loc de ~180), probabil pentru ca decimarea (ndec>0)
+    // cere si alte registre de demodulator. 75 (0x01) si 620 (0x8E) merg. Minim 75.
+    if (bw_khz < 75) bw_khz = 75;
     for (size_t i = 0; i < sizeof(IFBW_TAB) / sizeof(IFBW_TAB[0]); i++)
         if (IFBW_TAB[i].khz10 >= bw_khz * 10) return IFBW_TAB[i].reg;
     return 0x8E;                             // maxim ~620 kHz
