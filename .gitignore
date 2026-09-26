@@ -2,3 +2,17 @@ build/
 sdkconfig.old
 managed_components/
 referinte/
+# --- generat la import pe GitHub ---
+.pio/
+Debug/
+Release/
+__pycache__/
+*.pyc
+*.log
+*.exe
+*.msi
+*.whl
+*.7z
+*.zip
+*.rar
+*.backup
